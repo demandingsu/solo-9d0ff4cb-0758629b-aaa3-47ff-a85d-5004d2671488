@@ -5,6 +5,10 @@
 归并首次公告、更正公告与撤销公告，自动识别缺失引用、引用成环、并行更正等冲突，
 并输出每条链的状态、有效截止时间与来源链接。
 
+在此基础上，按**列表 URL（采购目录）**保存每条首次公告链最近一次完整采集的
+**可确认状态基准**，后续完整采集自动对比基准，记录投标截止时间的**提前、延后、
+撤销与恢复**变动，供按目录查询旧/新时间、公告编号与来源链接。
+
 技术栈：FastAPI + BeautifulSoup4 + SQLite，Docker Compose 同时启动采集 API
 与一个内置的示例公告站。
 
@@ -18,13 +22,14 @@
 │   ├── fetcher.py          # HTTP 抓取（超时 + 有限重试）
 │   ├── parser.py           # 列表页/详情页解析（BeautifulSoup）
 │   ├── chains.py           # 引用链归并、冲突识别、有效截止时间计算
+│   ├── changes.py          # 截止时间基准对比与变动记录
 │   ├── service.py          # 同步编排与持久化（含失败保留上次结果）
 │   ├── models.py           # 请求/响应模型
 │   └── main.py             # FastAPI 路由
 ├── sample_site/            # 示例公告站（仅 Python 标准库）
 │   ├── server.py
 │   └── Dockerfile
-├── tests/                  # pytest 测试（19 个用例）
+├── tests/                  # pytest 测试（28 个用例）
 ├── Dockerfile              # API 镜像
 ├── docker-compose.yml      # api + sample-site 两个服务
 └── requirements.txt
@@ -80,7 +85,9 @@ pytest -q
 | POST | `/api/v1/sync` | 同步指定列表页及其全部详情页，请求体 `{"list_url": "..."}` |
 | GET | `/api/v1/chains` | 返回全部引用链 `chains` 与孤立异常公告 `orphans` |
 | GET | `/api/v1/announcements/{notice_no}` | 查询单条公告（含抓取错误、链状态） |
-| GET | `/api/v1/sync-runs?limit=20` | 同步执行记录 |
+| GET | `/api/v1/sync-runs?limit=20` | 同步执行记录（含 `changes_recorded` 变动计数） |
+| GET | `/api/v1/baselines?list_url=...` | 按目录查询各链最近一次完整采集的可确认状态（基准） |
+| GET | `/api/v1/deadline-changes?list_url=...&limit=50` | 按目录查询截止时间变动：旧/新时间、公告编号、来源链接 |
 
 `/api/v1/chains` 响应示例（节选）：
 
@@ -150,12 +157,45 @@ pytest -q
 
 ### 详情抓取失败的容错
 
-- 列表页抓取失败：本次同步标记 `failed`，不动库内现有数据。
+- 列表页抓取/解析失败：本次同步标记 `failed`，不动库内现有数据、不推进基准。
 - 单条详情页抓取/解析失败：
   - 此前成功过 → **保留上次完整结果**，仅记录 `last_fetch_error` 与同步时间，
     同步状态为 `partial`，响应中 `kept_last` 计数；
   - 从未成功 → 写入占位记录并归入孤立异常，避免静默丢失。
 - 每次同步后基于库内现有数据全量重算链状态。
+
+### 截止时间变动追踪（基准对比）
+
+- 按 `(list_url, chain_id)` 为每条首次公告链保存**最近一次完整采集的可确认
+  状态**（`chain_baselines` 表）：确认的链状态（`ok`/`cancelled`）与有效截止
+  时间；新链首次出现**只建立基准**，不记录变动。
+- 仅当列表页与**全部**详情页均抓取、解析成功（完整采集）时，才与基准对比并在
+  同一事务内提交：
+
+  | 变动类型 | 触发条件 |
+  | --- | --- |
+  | `advanced` | 有效截止时间早于基准（提前） |
+  | `postponed` | 有效截止时间晚于基准（延后） |
+  | `revoked` | 链由正常变为撤销，新截止时间为 `null` |
+  | `restored` | 撤销解除、链恢复并重新给出截止时间 |
+
+- 列表页或任一详情页抓取/解析失败时：**不推进基准、不记录变动**；部分同步已
+  写入的更正公告，在恢复成功后的下一次完整采集中仍会被补发现（基准仍是旧状态）。
+- 链处于冲突时基准标记 `needs_review=true`（待核实）并**保留旧基准**，
+  解除冲突后的下一次完整采集再与保留的基准比较。
+- 重复同步相同内容不产生新记录（`deadline_changes` 对 `(run_id, chain_id)`
+  去重，且基准已是当前状态时对比结果为空）。
+- 基准更新与变动写入随同步事务**一起提交**，失败整体不生效。
+
+### 截止时间变动查询示例
+
+```bash
+# 某目录下各链的可确认状态基准（冲突链显示 needs_review=true）
+curl "http://localhost:8000/api/v1/baselines?list_url=http://sample-site:8080/announcements"
+
+# 该目录下的截止时间变动（旧/新时间、公告编号、来源链接）
+curl "http://localhost:8000/api/v1/deadline-changes?list_url=http://sample-site:8080/announcements"
+```
 
 ## 示例公告站内置场景
 
@@ -169,13 +209,44 @@ pytest -q
 | F-001 | 更正公告无引用编号 | 孤立，missing_reference |
 | G-001 / G-101（+G-102） | 同项目两个独立首次公告 | 两条独立链 |
 | H-001 | 可切换 500 故障 | 验证失败保留上次结果 |
+| I-001 / I-002 | 可切换截止时间、可在更正/撤销间切换 | 演示提前/延后/撤销/恢复变动追踪 |
 
-故障开关（仅示例站）：
+故障与场景开关（仅示例站）：
 
 ```bash
-curl "http://localhost:8080/fail-toggle?enabled=1"   # 开启 H-001 详情 500
-curl "http://localhost:8080/fail-toggle?enabled=0"   # 恢复
+curl "http://localhost:8080/fail-toggle?enabled=1"     # 开启 H-001 详情 500
+curl "http://localhost:8080/fail-toggle?enabled=0"     # 恢复
 curl "http://localhost:8080/fail-status"
+
+# 切换 I-001 的投标截止时间（不传或传空 -> 恢复默认 2026-12-10 09:30:00）
+curl "http://localhost:8080/deadline-toggle?deadline=2026-12-05%2009:30:00"  # 提前
+curl "http://localhost:8080/deadline-toggle?deadline=2026-12-20%2009:30:00"  # 延后
+curl "http://localhost:8080/deadline-toggle"                                 # 恢复默认
+curl "http://localhost:8080/deadline-status"
+
+# I-002 在更正公告/撤销公告之间切换，演示撤销与恢复
+curl "http://localhost:8080/revoke-toggle?enabled=1"   # 变为撤销公告
+curl "http://localhost:8080/revoke-toggle?enabled=0"   # 变回更正公告
+curl "http://localhost:8080/revoke-status"
+```
+
+### 端到端演示脚本（Docker Compose 启动后）
+
+```bash
+LIST=http://sample-site:8080/announcements
+
+# 1. 首次同步：只建立基准，changes_recorded=0
+curl -X POST http://localhost:8000/api/v1/sync -H 'Content-Type: application/json' \
+  -d "{\"list_url\": \"$LIST\"}"
+
+# 2. 在示例站把 I-001 截止时间提前，再次同步 -> 记录 advanced
+curl "http://localhost:8080/deadline-toggle?deadline=2026-12-05%2009:30:00"
+curl -X POST http://localhost:8000/api/v1/sync -H 'Content-Type: application/json' \
+  -d "{\"list_url\": \"$LIST\"}"
+
+# 3. 查询变动（旧/新时间、公告编号、来源链接）与基准
+curl "http://localhost:8000/api/v1/deadline-changes?list_url=$LIST"
+curl "http://localhost:8000/api/v1/baselines?list_url=$LIST"
 ```
 
 ## 配置项（环境变量）

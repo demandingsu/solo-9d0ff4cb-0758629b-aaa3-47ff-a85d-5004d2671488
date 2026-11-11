@@ -28,11 +28,21 @@ def site_base_url() -> str:
     port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    # 每个测试会话从正常状态开始
-    sample_server.FAIL_ENABLED["H-001"] = False
     yield f"http://127.0.0.1:{port}"
     httpd.shutdown()
     httpd.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_sample_site():
+    """每个测试前后都把示例站开关恢复默认，避免用例间状态污染。"""
+    sample_server.FAIL_ENABLED["H-001"] = False
+    sample_server.RUNTIME_DEADLINE["I-001"] = None
+    sample_server.REVOKE_ENABLED["I-002"] = False
+    yield
+    sample_server.FAIL_ENABLED["H-001"] = False
+    sample_server.RUNTIME_DEADLINE["I-001"] = None
+    sample_server.REVOKE_ENABLED["I-002"] = False
 
 
 @pytest.fixture()

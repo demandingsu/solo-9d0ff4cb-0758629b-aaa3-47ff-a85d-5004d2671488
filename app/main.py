@@ -7,6 +7,8 @@ POST /api/v1/sync                  同步指定列表页及其详情页
 GET  /api/v1/chains                查询全部引用链与孤立异常公告
 GET  /api/v1/announcements/{no}    查询单条公告
 GET  /api/v1/sync-runs             查询同步执行记录
+GET  /api/v1/baselines             按目录查询各链最近一次完整采集的可确认状态
+GET  /api/v1/deadline-changes      按目录查询截止时间变动（旧/新时间、编号、来源）
 """
 from __future__ import annotations
 
@@ -18,7 +20,11 @@ from fastapi import FastAPI, HTTPException
 from . import db, service
 from .models import (
     AnnouncementItem,
+    BaselineResponse,
     Chain,
+    ChainBaseline,
+    DeadlineChange,
+    DeadlineChangeResponse,
     OrphanAnnouncement,
     QueryResponse,
     SyncRequest,
@@ -149,9 +155,74 @@ def list_sync_runs(limit: int = 20) -> dict:
     conn = db.connect()
     rows = conn.execute(
         "SELECT run_id, list_url, started_at, finished_at, status, "
-        "total_listed, fetched_ok, failed_count, kept_last, message "
-        "FROM sync_runs ORDER BY id DESC LIMIT ?",
+        "total_listed, fetched_ok, failed_count, kept_last, changes_recorded, "
+        "message FROM sync_runs ORDER BY id DESC LIMIT ?",
         (limit,),
     ).fetchall()
     conn.close()
     return {"runs": [dict(r) for r in rows]}
+
+
+@app.get("/api/v1/baselines", response_model=BaselineResponse)
+def query_baselines(list_url: str) -> dict:
+    """按列表 URL 查询各首次公告链最近一次完整采集的可确认状态（基准）。"""
+    conn = db.connect()
+    db.init_db(conn)
+    rows = conn.execute(
+        "SELECT list_url, chain_id, head_notice_no, chain_status, "
+        "confirmed_deadline, needs_review, first_seen_at, last_checked_at "
+        "FROM chain_baselines WHERE list_url = ? ORDER BY chain_id",
+        (list_url,),
+    ).fetchall()
+    conn.close()
+    baselines = [
+        ChainBaseline(
+            chain_id=r["chain_id"],
+            head_notice_no=r["head_notice_no"],
+            chain_status=r["chain_status"],
+            confirmed_deadline=r["confirmed_deadline"],
+            needs_review=bool(r["needs_review"]),
+            first_seen_at=r["first_seen_at"],
+            last_checked_at=r["last_checked_at"],
+        )
+        for r in rows
+    ]
+    return {"list_url": list_url, "baselines": baselines}
+
+
+@app.get("/api/v1/deadline-changes", response_model=DeadlineChangeResponse)
+def query_deadline_changes(list_url: str | None = None, limit: int = 50) -> dict:
+    """查询截止时间变动：旧/新时间、公告编号、来源链接，可按目录过滤。"""
+    limit = max(1, min(limit, 200))
+    conn = db.connect()
+    db.init_db(conn)
+    if list_url:
+        rows = conn.execute(
+            "SELECT run_id, list_url, chain_id, change_type, old_deadline, "
+            "new_deadline, notice_no, source_url, detected_at "
+            "FROM deadline_changes WHERE list_url = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (list_url, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT run_id, list_url, chain_id, change_type, old_deadline, "
+            "new_deadline, notice_no, source_url, detected_at "
+            "FROM deadline_changes ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    changes = [
+        DeadlineChange(
+            chain_id=r["chain_id"],
+            change_type=r["change_type"],
+            old_deadline=r["old_deadline"],
+            new_deadline=r["new_deadline"],
+            notice_no=r["notice_no"],
+            source_url=r["source_url"],
+            run_id=r["run_id"],
+            detected_at=r["detected_at"],
+        )
+        for r in rows
+    ]
+    return {"list_url": list_url, "changes": changes}

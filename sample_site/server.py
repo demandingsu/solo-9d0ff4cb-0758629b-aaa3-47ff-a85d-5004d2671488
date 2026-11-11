@@ -9,10 +9,15 @@
   链 F：更正无引用编号（missing_reference -> 孤立）
   链 G：同一项目两个独立首次公告（保持两条独立链）
   公告 H：可通过 /fail-toggle 控制详情页返回 500，验证失败保留上次结果
+  链 I：截止时间与撤销可在线切换，演示提前/延后/撤销/恢复变动追踪
 
 控制接口：
-  GET /fail-toggle?enabled=1|0   开关 H-001 详情页的 500 故障
-  GET /fail-status               查询当前故障开关
+  GET /fail-toggle?enabled=1|0            开关 H-001 详情页的 500 故障
+  GET /fail-status                        查询故障开关
+  GET /deadline-toggle?deadline=<时间>    切换 I-001 的投标截止时间（空值恢复默认）
+  GET /deadline-status                    查询 I-001 当前截止时间
+  GET /revoke-toggle?enabled=1|0          切换 I-002 在更正公告/撤销公告之间
+  GET /revoke-status                      查询撤销开关
 """
 from __future__ import annotations
 
@@ -89,12 +94,50 @@ NOTICES: list[dict] = [
     {"no": "H-001", "project": "PRJ-H", "type": "首次公告",
      "publish": "2026-10-30 09:00:00", "deadline": "2026-11-30 09:30:00",
      "ref": ""},
+
+    # 链 I：可在线切换截止时间（I-001）与公告性质（I-002 在更正/撤销间切换）
+    {"no": "I-001", "project": "PRJ-I", "type": "首次公告",
+     "publish": "2026-11-02 09:00:00", "deadline": "2026-12-10 09:30:00",
+     "ref": ""},
+    {"no": "I-002", "project": "PRJ-I", "type": "更正公告",
+     "publish": "2026-11-05 15:00:00", "deadline": "",
+     "ref": "I-001"},
 ]
 
 NOTICE_BY_NO = {n["no"]: n for n in NOTICES}
 
-# 运行期故障开关（内存态，重启容器即恢复）
+# I-001 的默认与候选截止时间，运行期可通过 /deadline-toggle 切换
+I001_DEFAULT_DEADLINE = NOTICE_BY_NO["I-001"]["deadline"]
+I001_EARLIER_DEADLINE = "2026-12-05 09:30:00"   # 提前
+I001_LATER_DEADLINE = "2026-12-20 09:30:00"     # 延后
+
+# 运行期开关（内存态，重启容器即恢复）
 FAIL_ENABLED = {"H-001": False}
+# I-001 当前生效截止时间；None 表示使用公告内置默认值
+RUNTIME_DEADLINE: dict[str, str | None] = {"I-001": None}
+# I-002 是否为撤销公告：开启 -> 撤销公告（链失效）；关闭 -> 更正公告（链恢复）
+REVOKE_ENABLED = {"I-002": False}
+
+
+def effective_notices() -> list[dict]:
+    """叠加运行期开关后的公告列表（截止时间切换 + I-002 更正/撤销切换）。"""
+    result: list[dict] = []
+    for notice in NOTICES:
+        item = dict(notice)
+        no = notice["no"]
+        if no in RUNTIME_DEADLINE and RUNTIME_DEADLINE[no] is not None:
+            item["deadline"] = RUNTIME_DEADLINE[no]
+        if no == "I-002":
+            item["type"] = "撤销公告" if REVOKE_ENABLED["I-002"] else "更正公告"
+        result.append(item)
+    return result
+
+
+def effective_notice(no: str) -> dict | None:
+    for notice in effective_notices():
+        if notice["no"] == no:
+            return notice
+    return None
 
 PAGE_CSS = """
 body { font-family: sans-serif; margin: 2em; color: #222; }
@@ -108,20 +151,21 @@ a { color: #1a56c4; }
 
 
 def render_list() -> str:
+    notices = effective_notices()
     rows = "\n".join(
         '<tr><td><a href="/notice/{no}">{no}</a></td>'
         '<td>{project}</td><td>{type}</td><td>{publish}</td></tr>'.format(
             no=escape(n["no"]), project=escape(n["project"]),
             type=escape(n["type"]), publish=escape(n["publish"]),
         )
-        for n in NOTICES
+        for n in notices
     )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>公共采购公告列表</title><style>{PAGE_CSS}</style></head>
 <body>
 <h1>公共采购公告列表（示例站）</h1>
-<p class="meta">共 {len(NOTICES)} 条公告 · 仅用于演示采集 API</p>
+<p class="meta">共 {len(notices)} 条公告 · 仅用于演示采集 API</p>
 <table class="announcement-list">
 <thead><tr><th>公告编号</th><th>项目编号</th><th>类型</th><th>发布时间</th></tr></thead>
 <tbody>{rows}</tbody>
@@ -137,7 +181,7 @@ def _row(label: str, value: str) -> str:
 
 
 def render_detail(no: str) -> str:
-    n = NOTICE_BY_NO[no]
+    n = effective_notice(no)
     rows = "".join([
         _row("公告编号", n["no"]),
         _row("项目编号", n["project"]),
@@ -192,9 +236,45 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/deadline-toggle":
+            # deadline 缺省或为空 -> 恢复 I-001 内置默认截止时间
+            deadline = query.get("deadline", [""])[0].strip()
+            RUNTIME_DEADLINE["I-001"] = deadline or None
+            current = deadline or I001_DEFAULT_DEADLINE
+            self._send(
+                f'{{"notice_no": "I-001", "deadline": "{escape(current)}"}}',
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
+        if path == "/deadline-status":
+            current = RUNTIME_DEADLINE["I-001"] or I001_DEFAULT_DEADLINE
+            self._send(
+                f'{{"notice_no": "I-001", "deadline": "{escape(current)}"}}',
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
+        if path == "/revoke-toggle":
+            enabled = (query.get("enabled", ["0"])[0] in {"1", "true", "yes"})
+            REVOKE_ENABLED["I-002"] = enabled
+            self._send(
+                f'{{"I-002_revoke_enabled": {str(enabled).lower()}}}',
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
+        if path == "/revoke-status":
+            enabled = REVOKE_ENABLED["I-002"]
+            self._send(
+                f'{{"I-002_revoke_enabled": {str(enabled).lower()}}}',
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
         if path.startswith("/notice/"):
             no = path.rsplit("/", 1)[-1]
-            notice = NOTICE_BY_NO.get(no)
+            notice = effective_notice(no)
             if notice is None:
                 self._send("<h1>404 公告不存在</h1>", status=404)
                 return
