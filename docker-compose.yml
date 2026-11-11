@@ -1,0 +1,26 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DB_PATH: /data/procurement.db
+      FETCH_TIMEOUT: "10"
+      FETCH_RETRIES: "2"
+      KEEP_LAST_ON_DETAIL_FAILURE: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - api-data:/data
+    depends_on:
+      - sample-site
+
+  sample-site:
+    build:
+      context: .
+      dockerfile: sample_site/Dockerfile
+    ports:
+      - "8080:8080"
+
+volumes:
+  api-data:
